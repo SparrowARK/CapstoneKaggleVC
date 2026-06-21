@@ -29,7 +29,7 @@ graph TD
     B -->|Broadcast| A
 ```
 
-## 🌟 Key Technical Features (Kaggle Rubric Highlights)
+## 🌟 Key Technical Features
 
 ### 1. Multi-Agent System
 - **Vision Agent:** Analyzes raw pixel data to assign balanced stats. Spiky shapes yield high attack; bulky shapes yield high defense/HP.
