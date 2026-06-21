@@ -279,9 +279,21 @@ io.on('connection', (socket) => {
 
                 if (mcpClient) {
                     try {
+                        const battlePlayers = connectedPlayers.map(p => ({
+                            id: p.id,
+                            name: p.name,
+                            stats: {
+                                hp: p.stats.stats.hp,
+                                attack: p.stats.stats.attack,
+                                defense: p.stats.stats.defense,
+                                speed: p.stats.stats.speed
+                            },
+                            specialSkill: p.stats.specialSkill
+                        }));
+
                         const mcpResponse = await mcpClient.callTool({
                             name: "simulate_battle",
-                            arguments: { players: connectedPlayers }
+                            arguments: { players: battlePlayers }
                         });
                         const battleLog = JSON.parse(mcpResponse.content[0].text);
 
@@ -317,6 +329,18 @@ io.on('connection', (socket) => {
         broadcastRoomState(roomId);
     });
 
+    // ── LEAVE ROOM ──
+    socket.on('leaveRoom', () => {
+        if (socket.currentRoomId) {
+            const room = RoomManager.disconnectPlayer(socket.currentRoomId, socket.id);
+            if (room) {
+                broadcastRoomState(socket.currentRoomId);
+            }
+            socket.leave(socket.currentRoomId);
+            socket.currentRoomId = null;
+        }
+    });
+
     // ── DISCONNECT ──
     socket.on('disconnect', () => {
         console.log(`Socket disconnected: ${socket.id}`);
@@ -344,6 +368,18 @@ app.post('/api/evaluate-drawing', async (req, res) => {
     } catch (error) {
         console.error('REST evaluation error:', error);
         res.status(500).json({ error: 'Failed to evaluate drawing.' });
+    }
+});
+
+// ─────────────────────────────────────────────────────
+// Serve React Frontend (Production)
+// ─────────────────────────────────────────────────────
+const frontendDistPath = path.join(__dirname, '../frontend/dist');
+app.use(express.static(frontendDistPath));
+
+app.get('*', (req, res) => {
+    if (!req.path.startsWith('/api')) {
+        res.sendFile(path.join(frontendDistPath, 'index.html'));
     }
 });
 

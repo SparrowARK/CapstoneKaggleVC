@@ -13,7 +13,7 @@ const getSessionId = () => {
 };
 
 const sessionId = getSessionId();
-const socket = io('http://localhost:3001');
+const socket = io(import.meta.env.DEV ? 'http://localhost:3001' : undefined);
 
 const loadingMessages = [
   "Summoning the warriors...",
@@ -155,6 +155,13 @@ function App() {
     socket.emit('startNextRound', { roomId: room?.id });
   }, [room?.id]);
 
+  const handleLeaveRoom = useCallback(() => {
+    socket.emit('leaveRoom');
+    setRoom(null);
+    setRoomId('');
+    sessionStorage.removeItem('doodledoom_current_room');
+  }, []);
+
   // ─── Canvas Drawing Handlers ───
   const startDrawing = useCallback(({ nativeEvent }) => {
     if (room?.state !== 'DRAWING') return;
@@ -275,9 +282,14 @@ function App() {
               </li>
             ))}
           </ul>
-          <button onClick={toggleReady} style={{ marginTop: '20px', width: '100%', padding: '15px', fontSize: '1.1rem', ...(isReady ? { background: 'linear-gradient(135deg, #444, #333)' } : {}) }}>
-            {isReady ? 'Cancel Ready' : "I'm Ready!"}
-          </button>
+          <div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
+            <button onClick={handleLeaveRoom} style={{ flex: 1, padding: '15px', fontSize: '1rem', background: 'linear-gradient(135deg, var(--danger-color), var(--lose-color))', color: 'white' }}>
+              Leave Lobby
+            </button>
+            <button onClick={toggleReady} style={{ flex: 2, padding: '15px', fontSize: '1.1rem', ...(isReady ? { background: 'linear-gradient(135deg, #444, #333)' } : {}) }}>
+              {isReady ? 'Cancel Ready' : "I'm Ready!"}
+            </button>
+          </div>
         </div>
       )}
 

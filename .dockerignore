@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+.DS_Store
+.env
+frontend/node_modules
+frontend/dist
+backend/node_modules
+mcp-battle-engine/node_modules
+.gemini

@@ -127,21 +127,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }));
 
   try {
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [
-            {
-                role: 'user',
-                parts: [
-                    { text: `Simulate the battle for the following combatants:\n${JSON.stringify(combatants, null, 2)}` }
-                ]
+    let response = null;
+    let attempts = 0;
+
+    while (attempts < 3 && !response) {
+      try {
+        response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [
+                {
+                    role: 'user',
+                    parts: [
+                        { text: `Simulate the battle for the following combatants:\n${JSON.stringify(combatants, null, 2)}` }
+                    ]
+                }
+            ],
+            config: {
+                systemInstruction: battleSystemPrompt,
+                responseMimeType: "application/json",
             }
-        ],
-        config: {
-            systemInstruction: battleSystemPrompt,
-            responseMimeType: "application/json",
-        }
-    });
+        });
+      } catch (err) {
+        attempts++;
+        console.error(`MCP Battle Engine attempt ${attempts} failed:`, err.message);
+        if (attempts >= 3) throw err; // Proceed to fallback
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
 
     const battleLogText = response.text;
     
@@ -153,11 +165,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     return { content: [{ type: "text", text: JSON.stringify(battleLog) }] };
   } catch (error) {
-    console.error("AI Simulation Error:", error);
-    // Fallback if the AI fails
+    console.error("AI Simulation Error (Rate Limit / Failure):", error.message);
+    
+    // Cinematic Fallback if the AI fails due to rate limits
+    const p1 = combatants[0];
+    const p2 = combatants[1];
+    
     const fallbackLog = [
-        { turn: 1, type: 'attack', actorId: combatants[0].id, actorName: combatants[0].name, targetId: combatants[1].id, targetName: combatants[1].name, damage: 999, targetRemainingHp: 0, message: "AI Simulation Failed. Using instant KO fallback.", commentator: "The simulation broke down, folks! It's pure chaos!" },
-        { turn: 2, type: 'game_over', message: "Match aborted due to AI failure.", commentator: "We apologize for the technical difficulties.", winnerId: combatants[0].id }
+        { turn: 1, type: 'attack', actorId: p1.id, actorName: p1.name, targetId: p2.id, targetName: p2.name, damage: 15, targetRemainingHp: Math.max(0, p2.hp - 15), message: `${p1.name} unleashes a wild glitch attack!`, commentator: "Wait, the system is destabilizing! What is happening?!", actorTaunt: "01000111 01101100 01101001 01110100 01100011 01101000!" },
+        { turn: 2, type: 'attack', actorId: p2.id, actorName: p2.name, targetId: p1.id, targetName: p1.name, damage: 20, targetRemainingHp: Math.max(0, p1.hp - 20), message: `${p2.name} retaliates with a corrupted data strike!`, commentator: "The arena is falling apart! The graphics are tearing!", actorTaunt: "ERROR 404: MERCY NOT FOUND" },
+        { turn: 3, type: 'attack', actorId: p1.id, actorName: p1.name, targetId: p2.id, targetName: p2.name, damage: 999, targetRemainingHp: 0, message: `${p1.name} triggers a FATAL EXCEPTION, instantly crashing ${p2.name}!`, commentator: "IT'S A TOTAL SYSTEM CRASH! UNBELIEVABLE!" },
+        { turn: 4, type: 'game_over', message: `${p1.name} survives the system wipe!`, commentator: "What a bizarre and glitchy conclusion to the battle! The API gods demand a sacrifice!", winnerId: p1.id }
     ];
     return { content: [{ type: "text", text: JSON.stringify(fallbackLog) }] };
   }
