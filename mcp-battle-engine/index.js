@@ -123,7 +123,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     attack: p.stats.attack,
     defense: p.stats.defense,
     speed: p.stats.speed,
-    specialSkill: p.stats.specialSkill || { name: 'Basic Attack', description: 'Just hitting them.' }
+    specialSkill: p.specialSkill || { name: 'Basic Attack', description: 'A standard strike.' }
   }));
 
   try {
@@ -150,7 +150,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } catch (err) {
         attempts++;
         console.error(`MCP Battle Engine attempt ${attempts} failed:`, err.message);
-        if (attempts >= 3) throw err; // Proceed to fallback
+        if (attempts >= 3) throw err;
         await new Promise(r => setTimeout(r, 2000));
       }
     }
@@ -165,18 +165,115 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     return { content: [{ type: "text", text: JSON.stringify(battleLog) }] };
   } catch (error) {
-    console.error("AI Simulation Error (Rate Limit / Failure):", error.message);
+    console.error("AI Simulation Error — running local fallback battle:", error.message);
     
-    // Cinematic Fallback if the AI fails due to rate limits
-    const p1 = combatants[0];
-    const p2 = combatants[1];
-    
-    const fallbackLog = [
-        { turn: 1, type: 'attack', actorId: p1.id, actorName: p1.name, targetId: p2.id, targetName: p2.name, damage: 15, targetRemainingHp: Math.max(0, p2.hp - 15), message: `${p1.name} unleashes a wild glitch attack!`, commentator: "Wait, the system is destabilizing! What is happening?!", actorTaunt: "01000111 01101100 01101001 01110100 01100011 01101000!" },
-        { turn: 2, type: 'attack', actorId: p2.id, actorName: p2.name, targetId: p1.id, targetName: p1.name, damage: 20, targetRemainingHp: Math.max(0, p1.hp - 20), message: `${p2.name} retaliates with a corrupted data strike!`, commentator: "The arena is falling apart! The graphics are tearing!", actorTaunt: "ERROR 404: MERCY NOT FOUND" },
-        { turn: 3, type: 'attack', actorId: p1.id, actorName: p1.name, targetId: p2.id, targetName: p2.name, damage: 999, targetRemainingHp: 0, message: `${p1.name} triggers a FATAL EXCEPTION, instantly crashing ${p2.name}!`, commentator: "IT'S A TOTAL SYSTEM CRASH! UNBELIEVABLE!" },
-        { turn: 4, type: 'game_over', message: `${p1.name} survives the system wipe!`, commentator: "What a bizarre and glitchy conclusion to the battle! The API gods demand a sacrifice!", winnerId: p1.id }
+    // ─── Deterministic Fallback Battle Simulator ───
+    const p1 = { ...combatants[0], currentHp: combatants[0].hp };
+    const p2 = { ...combatants[1], currentHp: combatants[1].hp };
+
+    // Faster warrior goes first
+    const [first, second] = p1.speed >= p2.speed ? [p1, p2] : [p2, p1];
+    const order = [first, second];
+
+    const taunts = [
+      "You're going down!", "Is that all you've got?", "Bring it on!",
+      "Feel the fury!", "Too slow!", "You can't touch me!",
+      "This ends now!", "Prepare yourself!", "No mercy!"
     ];
+
+    const commentaryIntros = [
+      "What an incredible move!", "The crowd goes wild!",
+      "Absolutely devastating!", "What a display of power!",
+      "The arena shakes!", "Unbelievable technique!",
+      "The tension is electric!", "A masterful strike!"
+    ];
+
+    const specialCommentary = [
+      "They're unleashing their secret weapon!", "Here comes the signature move!",
+      "The crowd holds its breath!", "This is what we've been waiting for!"
+    ];
+
+    const fallbackLog = [];
+    let turn = 0;
+    let usedSpecial = { [first.id]: false, [second.id]: false };
+    let gameOver = false;
+
+    while (!gameOver) {
+      for (const attacker of order) {
+        if (gameOver) break;
+        turn++;
+
+        const defender = attacker.id === first.id ? second : first;
+
+        // Decide whether to use special skill
+        const shouldUseSpecial = !usedSpecial[attacker.id] && (
+          turn >= 3 || defender.currentHp < defender.hp * 0.5 || Math.random() > 0.6
+        );
+
+        // Calculate damage
+        let baseDamage = Math.max(1, attacker.attack - defender.defense * 0.4);
+        let variance = baseDamage * (0.8 + Math.random() * 0.4); // 80-120% variance
+        let damage = Math.round(variance);
+        let actionMessage = '';
+        let commentary = '';
+        let taunt = taunts[Math.floor(Math.random() * taunts.length)];
+
+        if (shouldUseSpecial) {
+          usedSpecial[attacker.id] = true;
+          damage = Math.round(damage * 1.5); // Special does 50% more
+          actionMessage = `${attacker.name} activates ${attacker.specialSkill.name}! ${attacker.specialSkill.description}`;
+          commentary = specialCommentary[Math.floor(Math.random() * specialCommentary.length)] +
+            ` ${attacker.name}'s ${attacker.specialSkill.name} deals a massive ${damage} damage!`;
+        } else {
+          actionMessage = `${attacker.name} strikes ${defender.name} with a powerful blow for ${damage} damage!`;
+          commentary = commentaryIntros[Math.floor(Math.random() * commentaryIntros.length)] +
+            ` ${attacker.name} connects for ${damage} damage!`;
+        }
+
+        defender.currentHp = Math.max(0, defender.currentHp - damage);
+
+        // Add low-HP tension commentary
+        if (defender.currentHp > 0 && defender.currentHp < defender.hp * 0.25) {
+          commentary += ` ${defender.name} is hanging by a thread!`;
+        }
+
+        fallbackLog.push({
+          turn, type: 'attack',
+          actorId: attacker.id, actorName: attacker.name,
+          targetId: defender.id, targetName: defender.name,
+          damage,
+          targetRemainingHp: defender.currentHp,
+          message: actionMessage,
+          commentator: commentary,
+          actorTaunt: taunt
+        });
+
+        if (defender.currentHp <= 0) {
+          fallbackLog.push({
+            turn: turn + 1, type: 'game_over',
+            message: `${attacker.name} wins the battle!`,
+            commentator: `What an epic showdown! ${attacker.name} emerges victorious after ${turn} grueling turns of combat! The arena erupts!`,
+            winnerId: attacker.id
+          });
+          gameOver = true;
+          break;
+        }
+
+        // Safety: end after 12 turns max to prevent infinite loops
+        if (turn >= 12) {
+          const winner = first.currentHp >= second.currentHp ? first : second;
+          fallbackLog.push({
+            turn: turn + 1, type: 'game_over',
+            message: `${winner.name} wins by endurance!`,
+            commentator: `After an exhausting ${turn}-turn slugfest, ${winner.name} stands tall with ${winner.currentHp} HP remaining! What a battle!`,
+            winnerId: winner.id
+          });
+          gameOver = true;
+          break;
+        }
+      }
+    }
+
     return { content: [{ type: "text", text: JSON.stringify(fallbackLog) }] };
   }
 });
