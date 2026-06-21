@@ -1,8 +1,8 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { io } from 'socket.io-client';
 import './index.css';
 
-// Generate or load a persistent Session ID for state recovery
+// ─── Session ID: Persistent across page refreshes ───
 const getSessionId = () => {
   let sid = sessionStorage.getItem('doodledoom_session_id');
   if (!sid) {
@@ -16,17 +16,19 @@ const sessionId = getSessionId();
 const socket = io('http://localhost:3001');
 
 const loadingMessages = [
-  "Tuning laser cannons...",
-  "Going to the arena...",
+  "Summoning the warriors...",
+  "Charging up the arena...",
   "Consulting the ancient scrolls...",
-  "Buffing the armor...",
+  "Buffing the armor plates...",
   "Crunching the battle numbers...",
+  "Sharpening the swords...",
   "Almost there..."
 ];
 
 function App() {
   const canvasRef = useRef(null);
-  
+  const roomIdRef = useRef(null); // Stable ref for the auto-submit handler
+
   const [roomId, setRoomId] = useState('');
   const [playerName, setPlayerName] = useState('');
   const [room, setRoom] = useState(null);
@@ -36,19 +38,20 @@ function App() {
   // Drawing state
   const [isDrawing, setIsDrawing] = useState(false);
 
-  // Battle State Buffer
+  // Battle State
   const [battleLog, setBattleLog] = useState(null);
   const [currentTurnIndex, setCurrentTurnIndex] = useState(0);
   const [currentEvent, setCurrentEvent] = useState(null);
   const [loadingIndex, setLoadingIndex] = useState(0);
 
+  // ─── Socket Event Listeners (mounted once) ───
   useEffect(() => {
     socket.on('roomStateUpdate', (updatedRoom) => {
       setRoom(updatedRoom);
-      
-      // Sync local ready state with server state for state recovery
+      roomIdRef.current = updatedRoom?.id;
+
       if (updatedRoom?.players[sessionId]) {
-         setIsReady(updatedRoom.players[sessionId].isReady);
+        setIsReady(updatedRoom.players[sessionId].isReady);
       }
 
       if (updatedRoom.state === 'LOBBY' || updatedRoom.state === 'DRAWING') {
@@ -64,9 +67,10 @@ function App() {
 
     socket.on('timesUp_submitDrawing', () => {
       const canvas = canvasRef.current;
-      if (canvas) {
+      const currentRoomId = roomIdRef.current;
+      if (canvas && currentRoomId) {
         const imageBase64 = canvas.toDataURL('image/png');
-        socket.emit('submitDrawing', { roomId: room?.id, imageBase64 });
+        socket.emit('submitDrawing', { roomId: currentRoomId, imageBase64 });
       }
     });
 
@@ -76,14 +80,8 @@ function App() {
     });
 
     socket.on('battleError', (errorMsg) => {
-      alert(errorMsg);
+      console.warn('Battle Error:', errorMsg);
     });
-
-    // Rejoin automatically if room exists in state (on refresh)
-    const savedRoomId = sessionStorage.getItem('doodledoom_current_room');
-    if (savedRoomId && !room) {
-        setRoomId(savedRoomId);
-    }
 
     return () => {
       socket.off('roomStateUpdate');
@@ -92,23 +90,23 @@ function App() {
       socket.off('battleLog');
       socket.off('battleError');
     };
-  }, [room?.id]);
+  }, []); // Empty deps — mount once
 
+  // ─── Canvas Setup ───
   useEffect(() => {
     if (room?.state === 'DRAWING' && canvasRef.current) {
       const canvas = canvasRef.current;
       const ctx = canvas.getContext('2d');
-      // If state recovery brought back a drawing, we would render it here
-      // For now, just clear white
       ctx.fillStyle = "white";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.lineCap = 'round';
-      ctx.lineWidth = 5;
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = 4;
       ctx.strokeStyle = 'black';
     }
   }, [room?.state]);
 
-  // Loading Messages Interval
+  // ─── Loading Messages Rotation ───
   useEffect(() => {
     if (room?.state === 'EVALUATING' || (room?.state === 'BATTLING' && !battleLog)) {
       const interval = setInterval(() => {
@@ -118,15 +116,13 @@ function App() {
     }
   }, [room?.state, battleLog]);
 
-  // Battle Animation Buffer Loop
+  // ─── Battle Animation Buffer ───
   useEffect(() => {
     if (battleLog && currentTurnIndex < battleLog.length) {
       const event = battleLog[currentTurnIndex];
       setCurrentEvent(event);
 
-      // Determine animation speed based on event type
-      const delay = event.type === 'game_over' ? 5000 : 3500; 
-
+      const delay = event.type === 'game_over' ? 4000 : 3000;
       const timer = setTimeout(() => {
         setCurrentTurnIndex(prev => prev + 1);
       }, delay);
@@ -134,180 +130,249 @@ function App() {
     }
   }, [battleLog, currentTurnIndex]);
 
-  const joinRoom = (e) => {
+  // ─── Actions ───
+  const handleCreateRoom = useCallback((e) => {
     e.preventDefault();
-    if (roomId && playerName) {
-      sessionStorage.setItem('doodledoom_current_room', roomId);
-      socket.emit('joinRoom', { roomId, sessionId, playerName });
-    }
-  };
+    if (!playerName.trim()) return;
+    const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+    sessionStorage.setItem('doodledoom_current_room', newRoomId);
+    socket.emit('joinRoom', { roomId: newRoomId, sessionId, playerName: playerName.trim() });
+  }, [playerName]);
 
-  const toggleReady = () => {
-    const nextReadyState = !isReady;
-    setIsReady(nextReadyState);
-    socket.emit('toggleReady', { roomId, isReady: nextReadyState });
-  };
+  const handleJoinRoom = useCallback((e) => {
+    e.preventDefault();
+    if (!roomId.trim() || !playerName.trim()) return;
+    const normalizedRoomId = roomId.trim().toUpperCase();
+    sessionStorage.setItem('doodledoom_current_room', normalizedRoomId);
+    socket.emit('joinRoom', { roomId: normalizedRoomId, sessionId, playerName: playerName.trim() });
+  }, [roomId, playerName]);
 
-  const startDrawing = ({ nativeEvent }) => {
+  const toggleReady = useCallback(() => {
+    socket.emit('toggleReady', { roomId: room?.id, isReady: !isReady });
+  }, [room?.id, isReady]);
+
+  const startNextRound = useCallback(() => {
+    socket.emit('startNextRound', { roomId: room?.id });
+  }, [room?.id]);
+
+  // ─── Canvas Drawing Handlers ───
+  const startDrawing = useCallback(({ nativeEvent }) => {
     if (room?.state !== 'DRAWING') return;
     const { offsetX, offsetY } = nativeEvent;
     const ctx = canvasRef.current.getContext('2d');
     ctx.beginPath();
     ctx.moveTo(offsetX, offsetY);
     setIsDrawing(true);
-  };
+  }, [room?.state]);
 
-  const finishDrawing = () => {
-    if (room?.state !== 'DRAWING') return;
-    const ctx = canvasRef.current.getContext('2d');
-    ctx.closePath();
+  const finishDrawing = useCallback(() => {
+    if (!isDrawing) return;
+    canvasRef.current.getContext('2d').closePath();
     setIsDrawing(false);
-  };
+  }, [isDrawing]);
 
-  const draw = ({ nativeEvent }) => {
+  const draw = useCallback(({ nativeEvent }) => {
     if (!isDrawing || room?.state !== 'DRAWING') return;
     const { offsetX, offsetY } = nativeEvent;
     const ctx = canvasRef.current.getContext('2d');
     ctx.lineTo(offsetX, offsetY);
     ctx.stroke();
-  };
+  }, [isDrawing, room?.state]);
 
+  // ─── Render: Home / Join Screen ───
   if (!room) {
     return (
       <div className="app-container">
         <h1>DoodleDoom ⚔️</h1>
-        <p>Join a room to battle your friends!</p>
-        <form onSubmit={joinRoom} style={{ display: 'flex', flexDirection: 'column', gap: '10px', alignItems: 'center' }}>
-          <input type="text" placeholder="Your Name" value={playerName} onChange={(e) => setPlayerName(e.target.value)} required style={{ padding: '0.5rem', borderRadius: '4px', border: 'none', width: '200px' }} />
-          <input type="text" placeholder="Room Code" value={roomId} onChange={(e) => setRoomId(e.target.value)} required style={{ padding: '0.5rem', borderRadius: '4px', border: 'none', width: '200px' }} />
-          <button type="submit">Join / Rejoin Room</button>
-        </form>
+        <p style={{ textAlign: 'center', color: '#aaa' }}>Draw. Battle. Dominate.</p>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', alignItems: 'center', maxWidth: '320px', margin: '0 auto' }}>
+          <input
+            type="text"
+            placeholder="Your Name"
+            value={playerName}
+            onChange={(e) => setPlayerName(e.target.value)}
+            maxLength={20}
+            style={{ padding: '0.8rem 1rem', borderRadius: '10px', width: '100%', fontSize: '1rem', fontWeight: '600' }}
+          />
+
+          <div style={{ width: '100%', background: 'rgba(255,255,255,0.04)', padding: '20px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.08)' }}>
+            <button onClick={handleCreateRoom} style={{ width: '100%', marginBottom: '12px' }} disabled={!playerName.trim()}>
+              Create New Room
+            </button>
+            <div style={{ textAlign: 'center', margin: '15px 0', fontSize: '0.85rem', color: '#555' }}>— OR —</div>
+            <input
+              type="text"
+              placeholder="Enter Room Code"
+              value={roomId}
+              onChange={(e) => setRoomId(e.target.value.toUpperCase())}
+              maxLength={10}
+              style={{ padding: '0.8rem 1rem', borderRadius: '10px', width: '100%', marginBottom: '12px', fontSize: '1.1rem', textAlign: 'center', letterSpacing: '3px', fontWeight: '700' }}
+            />
+            <button onClick={handleJoinRoom} style={{ width: '100%', background: 'linear-gradient(135deg, #444, #333)' }} disabled={!playerName.trim() || !roomId.trim()}>
+              Join Room
+            </button>
+          </div>
+        </div>
       </div>
     );
   }
 
-  const renderStatBar = (label, value, max) => {
+  // ─── Helpers ───
+  const renderStatBar = (label, value, max, isHp = false) => {
     const percentage = Math.min(100, Math.max(0, (value / max) * 100));
     return (
       <div className="stat-bar-container" key={label}>
         <div className="stat-label">{label}</div>
-        <div className="stat-bar-bg"><div className="stat-bar-fill" style={{ width: `${percentage}%` }}></div></div>
-        <div className="stat-value">{value}</div>
+        <div className="stat-bar-bg">
+          <div className={`stat-bar-fill${isHp ? ' hp' : ''}`} style={{ width: `${percentage}%` }}></div>
+        </div>
+        <div className="stat-value">{Math.round(value)}</div>
       </div>
     );
   };
 
+  const isGameOver = currentEvent && currentEvent.type === 'game_over';
+  const didIWin = isGameOver && currentEvent.winnerId === sessionId;
+
+  // ─── Render: Game UI ───
   return (
     <div className="app-container">
-      <h1>DoodleDoom ⚔️</h1>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div><strong>Room:</strong> {room.id}</div>
+      <h1>DoodleDoom ⚔️ <span style={{ fontSize: '0.9rem', color: '#666', marginLeft: '8px', fontWeight: '400' }}>Round {room.round || 1}</span></h1>
+
+      {/* Status Bar */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.04)', padding: '12px 20px', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.06)' }}>
+        <div>Room: <span className="room-code">{room.id}</span></div>
         {room.state === 'DRAWING' && (
-          <div style={{ fontSize: '1.5rem', color: timeRemaining <= 10 ? 'red' : 'var(--accent-color)', fontWeight: 'bold' }}>
+          <div style={{ fontSize: '1.5rem', color: timeRemaining <= 10 ? 'var(--danger-color)' : 'var(--accent-color)', fontWeight: '900', fontFamily: "'Outfit', sans-serif" }}>
             ⏱ {timeRemaining}s
           </div>
         )}
-        <div style={{ fontSize: '1.2rem', fontWeight: 'bold', color: 'var(--primary-color)' }}>
-          State: {room.state}
+        <div style={{ fontSize: '0.85rem', fontWeight: '600', color: '#888', textTransform: 'uppercase', letterSpacing: '1px' }}>
+          {room.state}
         </div>
       </div>
 
+      {/* ─── LOBBY ─── */}
       {room.state === 'LOBBY' && (
         <div className="results-panel">
-          <h2>Lobby</h2>
+          <h2 style={{ textAlign: 'center' }}>Lobby</h2>
+          <p style={{ textAlign: 'center', color: '#888', fontSize: '0.9rem' }}>Share code <span className="room-code">{room.id}</span> with friends!</p>
           <ul style={{ listStyle: 'none', padding: 0 }}>
             {Object.values(room.players).map(p => (
-              <li key={p.id} style={{ padding: '10px', margin: '5px 0', background: 'rgba(255,255,255,0.1)', borderRadius: '4px', display: 'flex', justifyContent: 'space-between', opacity: p.connected ? 1 : 0.5 }}>
-                <span>{p.name} {p.id === sessionId ? '(You)' : ''} {!p.connected && '(Disconnected)'}</span>
-                <span style={{ color: p.isReady ? '#0f0' : '#aaa' }}>{p.isReady ? 'READY' : 'Not Ready'}</span>
+              <li key={p.id} className={`lobby-player${!p.connected ? ' disconnected' : ''}`}>
+                <span style={{ fontWeight: '700' }}>
+                  {p.name}
+                  {p.id === sessionId && <span className="you-badge" style={{ display: 'inline-block', color: 'white', background: 'linear-gradient(135deg, var(--primary-color), #a06cdf)', padding: '2px 10px', borderRadius: '12px', fontSize: '0.7rem', marginLeft: '8px' }}>YOU</span>}
+                  {!p.connected && <span style={{ color: '#666', marginLeft: '8px', fontSize: '0.8rem' }}>(Offline)</span>}
+                </span>
+                <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
+                  <span className="score-badge">🏆 {p.score || 0}</span>
+                  <span style={{ color: p.isReady ? '#03dac6' : '#555', fontWeight: '700', fontSize: '0.85rem' }}>
+                    {p.isReady ? '✅ READY' : '⏳ Waiting'}
+                  </span>
+                </div>
               </li>
             ))}
           </ul>
-          <button onClick={toggleReady} style={{ marginTop: '10px', background: isReady ? '#555' : 'var(--primary-color)' }}>
-            {isReady ? 'Unready' : 'I am Ready!'}
+          <button onClick={toggleReady} style={{ marginTop: '20px', width: '100%', padding: '15px', fontSize: '1.1rem', ...(isReady ? { background: 'linear-gradient(135deg, #444, #333)' } : {}) }}>
+            {isReady ? 'Cancel Ready' : "I'm Ready!"}
           </button>
         </div>
       )}
 
+      {/* ─── DRAWING / EVALUATING ─── */}
       {(room.state === 'DRAWING' || room.state === 'EVALUATING') && (
         <>
-          <div className="prompt-box">Prompt: <strong>"{room.prompt}"</strong></div>
-          <div className="canvas-wrapper" style={{ pointerEvents: room.state === 'EVALUATING' ? 'none' : 'auto', opacity: room.state === 'EVALUATING' ? 0.5 : 1 }}>
-            <canvas ref={canvasRef} width={600} height={400} className="canvas-container" onMouseDown={startDrawing} onMouseUp={finishDrawing} onMouseOut={finishDrawing} onMouseMove={draw} />
+          <div className="prompt-box">Draw: <strong>"{room.prompt}"</strong></div>
+          <div style={{ pointerEvents: room.state === 'EVALUATING' ? 'none' : 'auto', opacity: room.state === 'EVALUATING' ? 0.5 : 1, transition: 'opacity 0.5s ease' }}>
+            <canvas ref={canvasRef} width={600} height={400} className="canvas-container"
+              onMouseDown={startDrawing} onMouseUp={finishDrawing} onMouseOut={finishDrawing} onMouseMove={draw}
+            />
           </div>
           {room.state === 'EVALUATING' && (
-            <h2 style={{ color: 'var(--accent-color)', animation: 'fadeIn 1s infinite alternate' }}>
-              {loadingMessages[loadingIndex]}
-            </h2>
+            <h2 className="loading-text">{loadingMessages[loadingIndex]}</h2>
           )}
         </>
       )}
 
+      {/* ─── BATTLING ─── */}
       {room.state === 'BATTLING' && (
         <div className="results-panel">
-          <h2>Warriors Ready! ⚔️</h2>
-          
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+            <h2 style={{ margin: 0 }}>⚔️ Arena</h2>
+            {isGameOver && (
+              <button onClick={startNextRound} style={{ padding: '10px 24px', fontSize: '1rem' }}>
+                Next Round →
+              </button>
+            )}
+          </div>
+
+          {/* Commentary */}
           {currentEvent ? (
-            <div style={{ marginBottom: '20px', padding: '15px', background: 'rgba(255,255,255,0.05)', borderRadius: '8px', borderLeft: '4px solid var(--accent-color)' }}>
-               {currentEvent.commentator && (
-                 <div style={{ fontStyle: 'italic', color: '#ffb74d', marginBottom: '10px' }}>
-                   🎤 Commentator: "{currentEvent.commentator}"
-                 </div>
-               )}
-               <div style={{ fontSize: '1.2rem', fontWeight: 'bold' }}>
-                 {currentEvent.message}
-               </div>
+            <div className="commentary-box">
+              {currentEvent.commentator && (
+                <div className="commentator-text">🎤 "{currentEvent.commentator}"</div>
+              )}
+              <div className="action-text">{currentEvent.message}</div>
             </div>
           ) : (
-            <h2 style={{ color: 'var(--accent-color)', animation: 'fadeIn 1s infinite alternate', textAlign: 'center' }}>
-              {loadingMessages[loadingIndex]}
-            </h2>
+            <h2 className="loading-text">{loadingMessages[loadingIndex]}</h2>
           )}
 
+          {/* Win/Lose Banner */}
+          {isGameOver && (
+            <div className={`win-banner ${didIWin ? 'victory' : 'defeat'}`}>
+              <h1 style={{ fontSize: '2.5rem', color: didIWin ? 'var(--win-color)' : 'var(--lose-color)', background: 'none', WebkitTextFillColor: 'unset', WebkitBackgroundClip: 'unset' }}>
+                {didIWin ? "🎉 YOU WIN!" : "💀 YOU LOSE!"}
+              </h1>
+            </div>
+          )}
+
+          {/* Player Cards */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
             {Object.values(room.players).map(p => {
-              // Calculate live HP based on battle log up to current index
-              let liveHp = p.stats?.stats.hp || 0;
+              let liveHp = p.stats?.stats?.hp || 0;
               if (battleLog && currentTurnIndex > 0) {
-                 for (let i = 0; i <= currentTurnIndex; i++) {
-                   const ev = battleLog[i];
-                   if (ev && ev.type === 'attack' && ev.targetId === p.id) {
-                     liveHp = ev.targetRemainingHp;
-                   }
-                 }
+                for (let i = 0; i <= Math.min(currentTurnIndex, battleLog.length - 1); i++) {
+                  const ev = battleLog[i];
+                  if (ev?.type === 'attack' && ev.targetId === p.id) {
+                    liveHp = ev.targetRemainingHp;
+                  }
+                }
               }
 
-              // Check if player is currently taunting
-              const isTaunting = currentEvent && currentEvent.actorId === p.id && currentEvent.actorTaunt;
+              const isTaunting = currentEvent?.actorId === p.id && currentEvent?.actorTaunt;
 
               return (
-                <div key={p.id} style={{ background: 'rgba(0,0,0,0.3)', padding: '15px', borderRadius: '8px', opacity: liveHp <= 0 ? 0.5 : 1, position: 'relative' }}>
-                  
+                <div key={p.id} className={`player-card${liveHp <= 0 ? ' defeated' : ''}`}>
                   {isTaunting && (
-                    <div style={{ position: 'absolute', top: '-40px', left: '10px', background: 'white', color: 'black', padding: '8px', borderRadius: '12px', zIndex: 10, animation: 'fadeIn 0.2s' }}>
-                      🗯️ "{currentEvent.actorTaunt}"
-                    </div>
+                    <div className="taunt-bubble">🗯️ "{currentEvent.actorTaunt}"</div>
                   )}
 
-                  <h3 style={{ margin: '0 0 10px 0', color: liveHp > 0 ? 'var(--accent-color)' : '#777' }}>
-                    {p.name} {liveHp <= 0 && '☠️'}
+                  <h3 style={{ margin: '0 0 8px 0', color: liveHp > 0 ? 'var(--accent-color)' : '#555', display: 'flex', alignItems: 'center', fontFamily: "'Outfit', sans-serif" }}>
+                    {p.name}
+                    {p.id === sessionId && <span className="you-badge">YOU</span>}
+                    {liveHp <= 0 && <span style={{ marginLeft: '8px' }}>☠️</span>}
                   </h3>
 
-                  {p.stats && p.stats.visualDescription && (
-                    <div style={{ fontStyle: 'italic', fontSize: '0.85rem', color: '#ccc', marginBottom: '15px', borderBottom: '1px solid #555', paddingBottom: '10px' }}>
-                      <strong>Warrior Profile:</strong> {p.stats.visualDescription}
+                  <div className="score-badge" style={{ marginBottom: '10px' }}>🏆 {p.score || 0}</div>
+
+                  {p.stats?.visualDescription && (
+                    <div style={{ fontStyle: 'italic', fontSize: '0.8rem', color: '#888', marginBottom: '12px', paddingBottom: '10px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                      {p.stats.visualDescription}
                     </div>
                   )}
-                  
+
                   {p.stats ? (
                     <>
-                      {renderStatBar('HP', liveHp, p.stats.stats.hp)}
+                      {renderStatBar('HP', liveHp, p.stats.stats.hp, true)}
                       {renderStatBar('ATK', p.stats.stats.attack, 50)}
                       {renderStatBar('DEF', p.stats.stats.defense, 40)}
                       {renderStatBar('SPD', p.stats.stats.speed, 100)}
                     </>
                   ) : (
-                    <p>Evaluation failed.</p>
+                    <p style={{ color: '#555' }}>Awaiting evaluation...</p>
                   )}
                 </div>
               );

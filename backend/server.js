@@ -18,13 +18,18 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ─────────────────────────────────────────────────────
+// Express & Socket.io Setup
+// ─────────────────────────────────────────────────────
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
-        origin: "http://localhost:5173",
+        origin: process.env.FRONTEND_URL || "http://localhost:5173",
         methods: ["GET", "POST"]
-    }
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000
 });
 
 const port = process.env.PORT || 3001;
@@ -32,13 +37,28 @@ const port = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Rate Limiting for the REST API
+// Rate Limiting — protects the REST API from abuse
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // limit each IP to 100 requests per windowMs
-    message: "Too many requests from this IP, please try again later."
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests from this IP, please try again later." }
 });
 app.use('/api/', apiLimiter);
+
+// Health check endpoint for deployment monitoring
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', mcpConnected: !!mcpClient, uptime: process.uptime() });
+});
+
+// ─────────────────────────────────────────────────────
+// Gemini Vision Agent Configuration
+// ─────────────────────────────────────────────────────
+if (!process.env.GEMINI_API_KEY) {
+    console.error("FATAL: GEMINI_API_KEY is not set in .env");
+    process.exit(1);
+}
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -67,13 +87,21 @@ Rules for balancing:
 - Distribute stats based on visuals: e.g., spiky/sharp elements -> higher attack; bulky/round -> higher defense/hp; streamlined/wheels -> higher speed.
 - Do NOT wrap the JSON in markdown code blocks, return ONLY raw JSON.`;
 
-// -----------------------------------------------------
-// Setup MCP Client for Battle Engine
-// -----------------------------------------------------
+const safetySettings = [
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_LOW_AND_ABOVE' },
+    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_LOW_AND_ABOVE' },
+    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_LOW_AND_ABOVE' },
+    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_LOW_AND_ABOVE' }
+];
+
+// ─────────────────────────────────────────────────────
+// MCP Client for Battle Engine
+// ─────────────────────────────────────────────────────
 let mcpClient = null;
+let mcpTransport = null;
 
 async function setupMcpClient() {
-    const transport = new StdioClientTransport({
+    mcpTransport = new StdioClientTransport({
         command: "node",
         args: [path.join(__dirname, "../mcp-battle-engine/index.js")],
     });
@@ -83,167 +111,263 @@ async function setupMcpClient() {
         { capabilities: {} }
     );
 
-    await mcpClient.connect(transport);
-    console.log("Connected to MCP Battle Engine");
+    await mcpClient.connect(mcpTransport);
+    console.log("✅ Connected to MCP Battle Engine");
 }
-setupMcpClient().catch(console.error);
+setupMcpClient().catch((err) => {
+    console.error("❌ Failed to connect to MCP Battle Engine:", err.message);
+});
 
-// -----------------------------------------------------
-// Socket.io Real-Time Mechanics
-// -----------------------------------------------------
+// ─────────────────────────────────────────────────────
+// Helper: Broadcast sanitized room state
+// ─────────────────────────────────────────────────────
+function broadcastRoomState(roomId) {
+    const room = RoomManager.getRoom(roomId);
+    if (room) {
+        io.to(roomId).emit('roomStateUpdate', RoomManager.sanitizeRoom(room));
+    }
+}
 
-// Socket Rate Limiting mechanism (simple in-memory token bucket or Map)
+// ─────────────────────────────────────────────────────
+// Helper: Evaluate drawing with retry + fallback
+// ─────────────────────────────────────────────────────
+async function evaluateDrawing(base64Data, prompt) {
+    let result = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: [{
+                    role: 'user',
+                    parts: [
+                        { text: `Evaluate this drawing for the prompt: "${prompt}"` },
+                        { inlineData: { data: base64Data, mimeType: "image/png" } }
+                    ]
+                }],
+                config: {
+                    systemInstruction,
+                    responseMimeType: "application/json",
+                    safetySettings
+                }
+            });
+            result = JSON.parse(response.text);
+            break;
+        } catch (err) {
+            console.error(`Vision Agent attempt ${attempt}/3 failed:`, err.message);
+            if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+
+    if (!result) {
+        // Fallback "glitch" stats so the game never gets stuck
+        result = {
+            matchScore: 0,
+            visualDescription: "A glitched anomaly — the Vision Agent could not decode this creation.",
+            stats: { hp: 50, attack: 10, defense: 10, speed: 10 },
+            specialSkill: { name: 'System Crash', description: 'An unpredictable glitch in the matrix.' },
+            reasoning: 'The Vision Agent failed to process the image after 3 attempts.'
+        };
+    }
+    return result;
+}
+
+// ─────────────────────────────────────────────────────
+// Socket Rate Limiting (per-session, in-memory)
+// ─────────────────────────────────────────────────────
 const socketRateLimits = new Map();
 function checkSocketRateLimit(sessionId) {
     const now = Date.now();
     const lastCalled = socketRateLimits.get(sessionId) || 0;
-    if (now - lastCalled < 2000) { // Limit to 1 evaluation per 2 seconds per session
-        return false;
-    }
+    if (now - lastCalled < 2000) return false;
     socketRateLimits.set(sessionId, now);
     return true;
 }
 
+// ─────────────────────────────────────────────────────
+// Socket.io Event Handlers
+// ─────────────────────────────────────────────────────
 io.on('connection', (socket) => {
     console.log(`Socket connected: ${socket.id}`);
 
+    // ── JOIN ROOM ──
     socket.on('joinRoom', ({ roomId, sessionId, playerName }) => {
+        // Input validation
+        if (!roomId || typeof roomId !== 'string' || roomId.length > 20) return;
+        if (!sessionId || typeof sessionId !== 'string') return;
+        if (!playerName || typeof playerName !== 'string') return;
+
+        const sanitizedName = playerName.trim().substring(0, 20);
+        if (!sanitizedName) return;
+
+        const room = RoomManager.getRoom(roomId);
+        // Prevent joining mid-game (unless reconnecting)
+        if (room && room.state !== 'LOBBY' && !room.players[sessionId]) {
+            socket.emit('battleError', 'Game is already in progress. Cannot join.');
+            return;
+        }
+
         socket.join(roomId);
-        // Map this socket to the session
         socket.sessionId = sessionId;
-        
-        RoomManager.addPlayer(roomId, sessionId, socket.id, playerName);
-        io.to(roomId).emit('roomStateUpdate', RoomManager.getRoom(roomId));
+        socket.currentRoomId = roomId;
+
+        RoomManager.addPlayer(roomId, sessionId, socket.id, sanitizedName);
+        broadcastRoomState(roomId);
     });
 
+    // ── TOGGLE READY ──
     socket.on('toggleReady', ({ roomId, isReady }) => {
-        if (!socket.sessionId) return;
-        RoomManager.setPlayerReady(roomId, socket.sessionId, isReady);
+        if (!socket.sessionId || !roomId) return;
         const room = RoomManager.getRoom(roomId);
-        io.to(roomId).emit('roomStateUpdate', room);
+        if (!room || room.state !== 'LOBBY') return;
 
-        if (room.state === 'LOBBY' && RoomManager.areAllPlayersReady(roomId)) {
+        RoomManager.setPlayerReady(roomId, socket.sessionId, isReady);
+        broadcastRoomState(roomId);
+
+        if (RoomManager.areAllPlayersReady(roomId)) {
             room.state = 'DRAWING';
-            room.timeRemaining = 60; // Increased to 60 seconds for more drawing time
-            io.to(roomId).emit('roomStateUpdate', room);
-            
+            room.timeRemaining = 60;
+            broadcastRoomState(roomId);
+
             room.timerInterval = setInterval(() => {
                 room.timeRemaining -= 1;
                 io.to(roomId).emit('timerUpdate', room.timeRemaining);
 
                 if (room.timeRemaining <= 0) {
                     clearInterval(room.timerInterval);
+                    room.timerInterval = null;
                     room.state = 'EVALUATING';
-                    io.to(roomId).emit('roomStateUpdate', room);
+                    broadcastRoomState(roomId);
                     io.to(roomId).emit('timesUp_submitDrawing');
                 }
             }, 1000);
         }
     });
 
+    // ── SUBMIT DRAWING ──
     socket.on('submitDrawing', async ({ roomId, imageBase64 }) => {
-        if (!socket.sessionId) return;
-        
+        if (!socket.sessionId || !roomId) return;
+        const room = RoomManager.getRoom(roomId);
+        if (!room) return;
+
         if (!checkSocketRateLimit(socket.sessionId)) {
             socket.emit('battleError', 'Rate limit exceeded. Please wait.');
             return;
         }
 
+        if (!imageBase64 || typeof imageBase64 !== 'string') return;
+
         RoomManager.setPlayerDrawing(roomId, socket.sessionId, imageBase64);
-        const room = RoomManager.getRoom(roomId);
-        
+
         try {
             const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "");
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: [
-                    {
-                        role: 'user',
-                        parts: [
-                            { text: `Evaluate this drawing for the prompt: "${room.prompt}"` },
-                            { inlineData: { data: base64Data, mimeType: "image/png" } }
-                        ]
-                    }
-                ],
-                config: {
-                    systemInstruction: systemInstruction,
-                    responseMimeType: "application/json",
-                    safetySettings: [
-                        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_LOW_AND_ABOVE' },
-                        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_LOW_AND_ABOVE' },
-                        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_LOW_AND_ABOVE' },
-                        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_LOW_AND_ABOVE' }
-                    ]
-                }
-            });
+            const jsonResult = await evaluateDrawing(base64Data, room.prompt);
 
-            const jsonResult = JSON.parse(response.text);
+            if (jsonResult.matchScore === 0 && jsonResult.stats.hp === 50) {
+                socket.emit('battleError', 'Warning: AI Evaluation failed after 3 attempts. You have been assigned Glitch Stats!');
+            }
+
             RoomManager.setPlayerStats(roomId, socket.sessionId, jsonResult);
-            
             io.to(roomId).emit('playerEvaluated', { sessionId: socket.sessionId, stats: jsonResult });
 
-            // Check if all connected players in room are evaluated
+            // Check if all connected players have been evaluated
             const connectedPlayers = Object.values(room.players).filter(p => p.connected);
             const allEvaluated = connectedPlayers.every(p => p.stats !== null);
-            
+
             if (allEvaluated && room.state === 'EVALUATING') {
                 room.state = 'BATTLING';
-                io.to(roomId).emit('roomStateUpdate', room);
-                
+                broadcastRoomState(roomId);
+
                 if (mcpClient) {
                     try {
                         const mcpResponse = await mcpClient.callTool({
                             name: "simulate_battle",
-                            arguments: {
-                                players: connectedPlayers
-                            }
+                            arguments: { players: connectedPlayers }
                         });
-                        const battleLogText = mcpResponse.content[0].text;
-                        const battleLog = JSON.parse(battleLogText);
+                        const battleLog = JSON.parse(mcpResponse.content[0].text);
+
+                        // Parse winner and increment score
+                        const gameOverEvent = battleLog.find(e => e.type === 'game_over');
+                        if (gameOverEvent?.winnerId) {
+                            RoomManager.incrementScore(roomId, gameOverEvent.winnerId);
+                        }
+
                         io.to(roomId).emit('battleLog', battleLog);
+                        broadcastRoomState(roomId); // Sends updated scores
                     } catch (mcpError) {
-                        console.error("MCP Battle Engine failed:", mcpError);
-                        io.to(roomId).emit('battleError', "Failed to simulate battle.");
+                        console.error("MCP Battle Engine failed:", mcpError.message);
+                        io.to(roomId).emit('battleError', "Failed to simulate battle. The Battle Engine may be overloaded.");
                     }
+                } else {
+                    io.to(roomId).emit('battleError', "Battle Engine is not connected. Please restart the server.");
                 }
             }
         } catch (error) {
-            console.error('Error evaluating drawing:', error);
-            socket.emit('battleError', 'Error evaluating drawing. Gemini might be busy.');
+            console.error('Unexpected error in submitDrawing:', error);
+            socket.emit('battleError', 'An unexpected error occurred during evaluation.');
         }
     });
 
+    // ── NEXT ROUND ──
+    socket.on('startNextRound', ({ roomId }) => {
+        if (!socket.sessionId || !roomId) return;
+        const room = RoomManager.getRoom(roomId);
+        if (!room || room.state !== 'BATTLING') return;
+
+        RoomManager.resetRoomForNextRound(roomId);
+        broadcastRoomState(roomId);
+    });
+
+    // ── DISCONNECT ──
     socket.on('disconnect', () => {
         console.log(`Socket disconnected: ${socket.id}`);
-        // Remove socket from all its rooms, and mark the player as disconnected
-        socket.rooms.forEach(roomId => {
-             const room = RoomManager.disconnectPlayer(roomId, socket.id);
-             if (room) {
-                io.to(roomId).emit('roomStateUpdate', room);
-             }
-        });
+        if (socket.currentRoomId) {
+            const room = RoomManager.disconnectPlayer(socket.currentRoomId, socket.id);
+            if (room) {
+                broadcastRoomState(socket.currentRoomId);
+            }
+        }
     });
 });
 
+// ─────────────────────────────────────────────────────
+// REST API (standalone evaluation — useful for testing)
+// ─────────────────────────────────────────────────────
 app.post('/api/evaluate-drawing', async (req, res) => {
     try {
         const { imageBase64, prompt } = req.body;
-        if (!imageBase64 || !prompt) return res.status(400).json({ error: 'Missing imageBase64 or prompt' });
+        if (!imageBase64 || !prompt) {
+            return res.status(400).json({ error: 'Missing imageBase64 or prompt' });
+        }
         const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "");
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [
-                { role: 'user', parts: [ { text: `Evaluate this drawing for the prompt: "${prompt}"` }, { inlineData: { data: base64Data, mimeType: "image/png" } } ] }
-            ],
-            config: { systemInstruction, responseMimeType: "application/json" }
-        });
-        res.json(JSON.parse(response.text));
+        const result = await evaluateDrawing(base64Data, prompt);
+        res.json(result);
     } catch (error) {
-        console.error('Error evaluating drawing:', error);
+        console.error('REST evaluation error:', error);
         res.status(500).json({ error: 'Failed to evaluate drawing.' });
     }
 });
 
+// ─────────────────────────────────────────────────────
+// Graceful Shutdown
+// ─────────────────────────────────────────────────────
+async function shutdown(signal) {
+    console.log(`\n${signal} received. Shutting down gracefully...`);
+    if (mcpClient) {
+        try { await mcpClient.close(); } catch (e) { /* ignore */ }
+    }
+    httpServer.close(() => {
+        console.log("Server closed.");
+        process.exit(0);
+    });
+    // Force exit after 5s if something hangs
+    setTimeout(() => process.exit(1), 5000);
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// ─────────────────────────────────────────────────────
+// Start Server
+// ─────────────────────────────────────────────────────
 httpServer.listen(port, () => {
-    console.log(`DoodleDoom backend running on http://localhost:${port}`);
+    console.log(`🎮 DoodleDoom backend running on http://localhost:${port}`);
 });
